@@ -1,0 +1,131 @@
+1.2 :
+
+CREATE OR REPLACE VIEW public.studentgpa
+ AS
+ SELECT s.am AS "AM",
+    (p.name::text || ' '::text) || p.surname::text AS "Full name",
+    round(sum((r.exam_grade + r.lab_grade) * u.weight_factor) / sum(u.weight_factor), 1) AS "Yearly grade",
+    date_part('year'::text, s.entry_date) AS "Academic year"
+   FROM "Student" s
+     JOIN "Person" p ON s.amka::text = p.amka::text
+     LEFT JOIN "Register" r ON s.amka::text = r.amka::text
+     LEFT JOIN "CourseRun" cr ON r.course_code = cr.course_code AND r.serial_number = cr.serial_number
+     JOIN ( SELECT c."CustomUnitID",
+                CASE
+                    WHEN c."Credits" = ANY (ARRAY[1, 2]) THEN 1::numeric
+                    WHEN c."Credits" = ANY (ARRAY[3, 4]) THEN 1.5
+                    WHEN c."Credits" = 5 THEN 2::numeric
+                    ELSE NULL::numeric
+                END AS weight_factor,
+            cr_1.semesterrunsin AS "SeasonalProgramID"
+           FROM "CustomUnits" c
+             JOIN "CourseRun" cr_1 ON c."CustomUnitID"::character varying::text = cr_1.course_code::character varying::text) u ON cr.course_code = u."CustomUnitID"::character(1) AND cr.semesterrunsin = u."SeasonalProgramID"
+  WHERE r.register_status = 'pass'::register_status_type AND date_part('year'::text, s.entry_date) = (date_part('year'::text, CURRENT_DATE) - 1::double precision)
+  GROUP BY s.am, p.name, p.surname, s.entry_date;
+
+ALTER TABLE public.studentgpa
+    OWNER TO postgres;
+
+
+
+
+2.4 : 
+CREATE OR REPLACE FUNCTION public.insert_thesis(
+	student_amka character varying,
+	thesis_title character varying,
+	program_id integer)
+    RETURNS void
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE PARALLEL UNSAFE
+AS $BODY$
+DECLARE
+  committee_members INTEGER[];
+  committee_size INTEGER;
+  grade numeric;
+  final_grade numeric;
+  diploma_type diploma_type;
+BEGIN
+  --Choose professors from the program
+  SELECT ARRAY_AGG(amka) INTO committee_members
+  FROM public."Professor"
+  WHERE labjoins IN (
+    SELECT lab_code
+    FROM public."Lab"
+    --WHERE "ProgramID" = program_id
+  );
+
+  --Random choice of committee members
+  committee_size := ARRAY_LENGTH(committee_members, 1);
+  committee_members := committee_members[1 : committee_size];
+  
+  --Random calculation of grade(5-10)
+  grade := FLOOR(RANDOM() * 6 + 5)::numeric;
+
+  --Check if the requirements for degree/certificate/diploma are fulfilled
+  SELECT "DiplomaType" INTO diploma_type
+  FROM public."Program" pro
+  WHERE pro."ProgramID" = program_id;
+
+  IF diploma_type = 'degree' AND grade >= 5 THEN
+    final_grade := grade;
+    --Create degree
+    INSERT INTO public."Degree" ("StudentAMKA", "ThesisTitle", "Grade")
+	VALUES (student_amka, thesis_title, final_grade);
+  ELSIF diploma_type = 'diploma' AND grade >= 5 THEN
+    final_grade := grade;
+    --Create diploma
+    INSERT INTO public."Diploma" ("StudentAMKA", "ThesisTitle", "Grade")
+    VALUES (student_amka, thesis_title, final_grade);
+  ELSIF diploma_type = 'certificate' AND grade >= 5 THEN
+    final_grade := grade;
+    -- Create certificate
+    INSERT INTO public."Certificate" ("StudentAMKA", "ThesisTitle", "Grade")
+	VALUES (student_amka, thesis_title, final_grade);
+  END IF;
+
+  --Insert thesis
+ 	INSERT INTO public."Thesis" ("StudentAMKA", "Title", "ProgramID", "Grade")
+	VALUES (student_amka, thesis_title, program_id, grade);
+
+END;
+$BODY$;
+
+ALTER FUNCTION public.insert_thesis(character varying, character varying, integer)
+    OWNER TO postgres;
+
+
+
+4.3 : 
+
+CREATE OR REPLACE FUNCTION public.check_registration()
+    RETURNS trigger
+    LANGUAGE 'plpgsql'
+    COST 100
+    VOLATILE NOT LEAKPROOF
+AS $BODY$
+DECLARE
+	total_credits integer;
+BEGIN
+	--Check requirements of courses
+	IF NEW.register_status = 'approved' AND (OLD.register_status = 'requested' OR OLD.register_status='proposed') THEN
+	--Calculate credits
+	SELECT SUM(c.units)
+	INTO total_credits
+	FROM public."Register" r
+	JOIN public."Course" c ON r.course_code = c.course_code
+	WHERE r.amka = NEW.amka;
+	
+	--Check if the credits exceed the number of 50
+	IF total_credits + NEW.units > 50 THEN
+		 NEW.register_status = 'rejected';
+		 RAISE EXCEPTION 'Credits exceed the limit of 50';
+	END IF;
+	END IF;
+	
+	RETURN NEW;
+END;
+$BODY$;
+
+ALTER FUNCTION public.check_registration()
+    OWNER TO postgres;
